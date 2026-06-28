@@ -1,11 +1,30 @@
-*.iml
-.gradle
-/local.properties
-/.idea/
-.DS_Store
-/build
-/app/release/
-/captures
-.externalNativeBuild
-.cxx
+# Gradle
+.gradle/
+build/
 local.properties
+
+# Android Studio / IntelliJ
+.idea/
+*.iml
+captures/
+.externalNativeBuild/
+.cxx/
+misc.xml
+deploymentTargetDropDown.xml
+render.experimental.xml
+
+# Build and release artifacts
+app/release/
+*.aab
+*.apk
+output-metadata.json
+
+# Signing and service configuration
+*.jks
+*.keystore
+google-services.json
+
+# Logs, profiling, and OS files
+*.log
+*.hprof
+.DS_Store
