@@ -30,8 +30,10 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.SwipeToDismissBox
@@ -47,12 +49,18 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
@@ -61,6 +69,8 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import coil.compose.AsyncImage
 import com.jx.jxcnbeta.ui.theme.JxCnbetaTheme
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -89,6 +99,7 @@ data class NewsUiState(
     val error: String? = null,
     val readIds: Set<String> = emptySet(),
     val hiddenIds: Set<String> = emptySet(),
+    val hasNewItems: Boolean = false,
 )
 
 data class ArticleUiState(
@@ -96,6 +107,10 @@ data class ArticleUiState(
     val article: NewsArticle? = null,
     val isLoading: Boolean = true,
     val error: String? = null,
+    val comments: List<ArticleComment> = emptyList(),
+    val isLoadingComments: Boolean = false,
+    val commentsError: String? = null,
+    val commentsAvailable: Boolean = false,
 )
 
 class CnbetaViewModel(
@@ -109,6 +124,10 @@ class CnbetaViewModel(
 
     private val _articleState = MutableStateFlow<ArticleUiState?>(null)
     val articleState: StateFlow<ArticleUiState?> = _articleState
+
+    private var articleLoadJob: Job? = null
+    private var commentsLoadJob: Job? = null
+    private var newItemsCheckJob: Job? = null
 
     init {
         observePersistedState()
@@ -129,6 +148,7 @@ class CnbetaViewModel(
     }
 
     fun reload() {
+        newItemsCheckJob?.cancel()
         viewModelScope.launch {
             val current = _newsState.value
             _newsState.value = current.copy(
@@ -138,6 +158,7 @@ class CnbetaViewModel(
                 isLoadingMore = false,
                 canLoadMore = true,
                 error = null,
+                hasNewItems = false,
             )
 
             runCatching { repository.fetchLatest(1) }
@@ -192,31 +213,47 @@ class CnbetaViewModel(
 
     fun openArticle(item: NewsItem) {
         markRead(item.id, read = true)
-        viewModelScope.launch {
+        articleLoadJob?.cancel()
+        commentsLoadJob?.cancel()
+        articleLoadJob = viewModelScope.launch {
             val cachedArticle = repository.getCachedArticle(item.id)
             _articleState.value = ArticleUiState(
                 item = item,
                 article = cachedArticle,
                 isLoading = cachedArticle == null,
+                isLoadingComments = item.source == NewsSource.CN_BETA,
+                commentsAvailable = item.source == NewsSource.CN_BETA,
             )
+            loadComments(item)
 
             runCatching { repository.refreshArticle(item) }
                 .onSuccess { article ->
-                    _articleState.value = ArticleUiState(
-                        item = item,
-                        article = article,
-                        isLoading = false,
-                    )
+                    val current = _articleState.value
+                    if (current?.item?.id == item.id) {
+                        _articleState.value = current.copy(
+                            article = article,
+                            isLoading = false,
+                            error = null,
+                        )
+                    }
                 }
                 .onFailure { throwable ->
+                    if (throwable is CancellationException) return@onFailure
+                    val current = _articleState.value
                     if (cachedArticle == null) {
-                        _articleState.value = ArticleUiState(
+                        _articleState.value = current?.copy(
+                            isLoading = false,
+                            error = throwable.readableMessage(),
+                        ) ?: ArticleUiState(
                             item = item,
                             isLoading = false,
                             error = throwable.readableMessage(),
                         )
                     } else {
-                        _articleState.value = ArticleUiState(
+                        _articleState.value = current?.copy(
+                            article = cachedArticle,
+                            isLoading = false,
+                        ) ?: ArticleUiState(
                             item = item,
                             article = cachedArticle,
                             isLoading = false,
@@ -227,7 +264,54 @@ class CnbetaViewModel(
     }
 
     fun closeArticle() {
+        articleLoadJob?.cancel()
+        commentsLoadJob?.cancel()
         _articleState.value = null
+        checkForNewItems()
+    }
+
+    private fun loadComments(item: NewsItem) {
+        if (item.source != NewsSource.CN_BETA) return
+
+        commentsLoadJob = viewModelScope.launch {
+            runCatching { repository.fetchComments(item) }
+                .onSuccess { comments ->
+                    val current = _articleState.value
+                    if (current?.item?.id == item.id) {
+                        _articleState.value = current.copy(
+                            comments = comments,
+                            isLoadingComments = false,
+                            commentsError = null,
+                        )
+                    }
+                }
+                .onFailure { throwable ->
+                    if (throwable is CancellationException) return@onFailure
+                    val current = _articleState.value
+                    if (current?.item?.id == item.id) {
+                        _articleState.value = current.copy(
+                            isLoadingComments = false,
+                            commentsError = throwable.readableMessage(),
+                        )
+                    }
+                }
+        }
+    }
+
+    private fun checkForNewItems() {
+        val current = _newsState.value
+        if (current.items.isEmpty() || current.hasNewItems) return
+
+        val knownIds = current.items.mapTo(mutableSetOf()) { it.id }
+        newItemsCheckJob?.cancel()
+        newItemsCheckJob = viewModelScope.launch {
+            runCatching { repository.fetchLatest(1) }
+                .onSuccess { latestItems ->
+                    if (latestItems.any { it.id !in knownIds }) {
+                        _newsState.update { it.copy(hasNewItems = true) }
+                    }
+                }
+        }
     }
 
     fun markRead(id: String, read: Boolean) {
@@ -258,17 +342,52 @@ class CnbetaViewModel(
 fun CnbetaApp(viewModel: CnbetaViewModel = androidx.lifecycle.viewmodel.compose.viewModel()) {
     val newsState by viewModel.newsState.collectAsState()
     val articleState by viewModel.articleState.collectAsState()
+    val newsListState = rememberLazyListState()
+    val coroutineScope = rememberCoroutineScope()
+    var savedListIndex by rememberSaveable { mutableStateOf(0) }
+    var savedListOffset by rememberSaveable { mutableStateOf(0) }
+    var shouldRestoreListPosition by rememberSaveable { mutableStateOf(false) }
+    var searchQuery by rememberSaveable { mutableStateOf("") }
+    val visibleItemCount = newsState.items.count { it.id !in newsState.hiddenIds }
+    val refreshNews: () -> Unit = {
+        coroutineScope.launch {
+            if (newsState.items.isNotEmpty()) {
+                newsListState.scrollToItem(0)
+            }
+            viewModel.reload()
+        }
+    }
+    val openArticle: (NewsItem) -> Unit = { item ->
+        savedListIndex = newsListState.firstVisibleItemIndex
+        savedListOffset = newsListState.firstVisibleItemScrollOffset
+        shouldRestoreListPosition = false
+        viewModel.openArticle(item)
+    }
+    val closeArticle: () -> Unit = {
+        shouldRestoreListPosition = true
+        viewModel.closeArticle()
+    }
+
+    LaunchedEffect(articleState, shouldRestoreListPosition, visibleItemCount) {
+        if (articleState == null && shouldRestoreListPosition && visibleItemCount > 0) {
+            newsListState.scrollToItem(
+                index = savedListIndex.coerceAtMost(visibleItemCount - 1),
+                scrollOffset = savedListOffset,
+            )
+            shouldRestoreListPosition = false
+        }
+    }
 
     BackHandler(enabled = articleState != null) {
-        viewModel.closeArticle()
+        closeArticle()
     }
 
     Scaffold(
         topBar = {
             NewsTopBar(
                 isArticleOpen = articleState != null,
-                onBack = viewModel::closeArticle,
-                onRefresh = viewModel::reload,
+                onBack = closeArticle,
+                onRefresh = refreshNews,
             )
         },
     ) { innerPadding ->
@@ -281,10 +400,18 @@ fun CnbetaApp(viewModel: CnbetaViewModel = androidx.lifecycle.viewmodel.compose.
         } else {
             NewsListScreen(
                 state = newsState,
+                listState = newsListState,
+                searchQuery = searchQuery,
+                onSearchQueryChange = { query ->
+                    searchQuery = query
+                    coroutineScope.launch {
+                        newsListState.scrollToItem(0)
+                    }
+                },
                 contentPadding = innerPadding,
-                onRefresh = viewModel::reload,
+                onRefresh = refreshNews,
                 onLoadMore = viewModel::loadMore,
-                onOpenArticle = viewModel::openArticle,
+                onOpenArticle = openArticle,
                 onToggleRead = { item, read -> viewModel.markRead(item.id, read) },
                 onDeleteNews = { item -> viewModel.deleteNews(item.id) },
             )
@@ -331,6 +458,9 @@ private fun NewsTopBar(
 @Composable
 private fun NewsListScreen(
     state: NewsUiState,
+    listState: LazyListState,
+    searchQuery: String,
+    onSearchQueryChange: (String) -> Unit,
     contentPadding: PaddingValues,
     onRefresh: () -> Unit,
     onLoadMore: () -> Unit,
@@ -338,39 +468,80 @@ private fun NewsListScreen(
     onToggleRead: (NewsItem, Boolean) -> Unit,
     onDeleteNews: (NewsItem) -> Unit,
 ) {
-    val listState = rememberLazyListState()
-
-    LaunchedEffect(listState, state.items.size, state.canLoadMore) {
+    LaunchedEffect(listState, state.items.size, state.canLoadMore, searchQuery) {
         snapshotFlow { listState.isNearBottom() }
             .distinctUntilChanged()
-            .filter { it }
+            .filter { it && searchQuery.isBlank() }
             .collect { onLoadMore() }
     }
 
     PullToRefreshBox(
-        isRefreshing = state.isInitialLoading || state.isLoadingMore,
-        onRefresh = {
-            if (state.items.isEmpty()) onRefresh() else onLoadMore()
-        },
+        isRefreshing = state.isInitialLoading,
+        onRefresh = onRefresh,
         modifier = Modifier
             .fillMaxSize()
             .padding(contentPadding),
     ) {
-        when {
-            state.isInitialLoading && state.items.isEmpty() -> LoadingPane()
-            state.items.isEmpty() && state.error != null -> ErrorPane(
-                message = state.error,
-                action = "Retry",
-                onAction = onRefresh,
-            )
+        Box(modifier = Modifier.fillMaxSize()) {
+            when {
+                state.isInitialLoading && state.items.isEmpty() -> LoadingPane()
+                state.items.isEmpty() && state.error != null -> ErrorPane(
+                    message = state.error,
+                    action = "Retry",
+                    onAction = onRefresh,
+                )
 
-            else -> NewsList(
-                state = state,
-                listState = listState,
-                onLoadMore = onLoadMore,
-                onOpenArticle = onOpenArticle,
-                onToggleRead = onToggleRead,
-                onDeleteNews = onDeleteNews,
+                else -> NewsList(
+                    state = state,
+                    listState = listState,
+                    searchQuery = searchQuery,
+                    onSearchQueryChange = onSearchQueryChange,
+                    onLoadMore = onLoadMore,
+                    onOpenArticle = onOpenArticle,
+                    onToggleRead = onToggleRead,
+                    onDeleteNews = onDeleteNews,
+                )
+            }
+
+            if (state.hasNewItems && state.items.isNotEmpty()) {
+                NewArticlesToast(
+                    onRefresh = onRefresh,
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .padding(top = 12.dp),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun NewArticlesToast(
+    onRefresh: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        modifier = modifier.clickable(onClick = onRefresh),
+        shape = RoundedCornerShape(50),
+        color = MaterialTheme.colorScheme.primaryContainer,
+        contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+        tonalElevation = 4.dp,
+        shadowElevation = 6.dp,
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = "New articles available",
+                style = MaterialTheme.typography.labelLarge,
+            )
+            Text(
+                text = "REFRESH",
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.primary,
             )
         }
     }
@@ -380,12 +551,20 @@ private fun NewsListScreen(
 private fun NewsList(
     state: NewsUiState,
     listState: LazyListState,
+    searchQuery: String,
+    onSearchQueryChange: (String) -> Unit,
     onLoadMore: () -> Unit,
     onOpenArticle: (NewsItem) -> Unit,
     onToggleRead: (NewsItem, Boolean) -> Unit,
     onDeleteNews: (NewsItem) -> Unit,
 ) {
-    val visibleItems = state.items.filterNot { it.id in state.hiddenIds }
+    val trimmedQuery = searchQuery.trim()
+    val visibleItems = state.items
+        .filterNot { it.id in state.hiddenIds }
+        .filter { item ->
+            trimmedQuery.isBlank() ||
+                item.title.contains(trimmedQuery, ignoreCase = true)
+        }
 
     LazyColumn(
         state = listState,
@@ -393,6 +572,19 @@ private fun NewsList(
         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
+        item(key = "news-search") {
+            NewsSearchBox(
+                query = searchQuery,
+                onQueryChange = onSearchQueryChange,
+            )
+        }
+
+        if (visibleItems.isEmpty() && trimmedQuery.isNotBlank()) {
+            item(key = "empty-search") {
+                EmptySearchResult(query = trimmedQuery)
+            }
+        }
+
         items(
             items = visibleItems,
             key = { it.id },
@@ -410,7 +602,7 @@ private fun NewsList(
             when {
                 state.isLoadingMore -> LoadingMoreRow()
                 state.error != null -> RetryMoreRow(state.error, onLoadMore)
-                state.canLoadMore -> TextButton(
+                state.canLoadMore && trimmedQuery.isBlank() -> TextButton(
                     onClick = onLoadMore,
                     modifier = Modifier.fillMaxWidth(),
                 ) {
@@ -422,6 +614,44 @@ private fun NewsList(
 }
 
 @Composable
+private fun NewsSearchBox(
+    query: String,
+    onQueryChange: (String) -> Unit,
+) {
+    OutlinedTextField(
+        value = query,
+        onValueChange = onQueryChange,
+        modifier = Modifier.fillMaxWidth(),
+        singleLine = true,
+        label = { Text("Search news keyword") },
+        placeholder = { Text("Filter loaded news by title") },
+        trailingIcon = {
+            if (query.isNotEmpty()) {
+                TextButton(onClick = { onQueryChange("") }) {
+                    Text("Clear")
+                }
+            }
+        },
+    )
+}
+
+@Composable
+private fun EmptySearchResult(query: String) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(8.dp),
+        color = MaterialTheme.colorScheme.surfaceContainerLow,
+    ) {
+        Text(
+            text = "No loaded news matched \"$query\"",
+            modifier = Modifier.padding(16.dp),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+@Composable
 private fun NewsItemCard(
     item: NewsItem,
     isRead: Boolean,
@@ -429,16 +659,54 @@ private fun NewsItemCard(
     onToggleRead: (Boolean) -> Unit,
     onDelete: () -> Unit,
 ) {
+    var showDeleteConfirmation by rememberSaveable(item.id) { mutableStateOf(false) }
+    val currentIsRead by rememberUpdatedState(isRead)
+    val currentOnToggleRead by rememberUpdatedState(onToggleRead)
     val dismissState = rememberSwipeToDismissBoxState(
         confirmValueChange = { value ->
             when (value) {
-                SwipeToDismissBoxValue.StartToEnd -> onToggleRead(!isRead)
-                SwipeToDismissBoxValue.EndToStart -> onDelete()
+                SwipeToDismissBoxValue.StartToEnd -> currentOnToggleRead(!currentIsRead)
+                SwipeToDismissBoxValue.EndToStart -> showDeleteConfirmation = true
                 SwipeToDismissBoxValue.Settled -> Unit
             }
-            value == SwipeToDismissBoxValue.EndToStart
+            false
         },
     )
+
+    LaunchedEffect(isRead) {
+        dismissState.reset()
+    }
+
+    if (showDeleteConfirmation) {
+        AlertDialog(
+            onDismissRequest = { showDeleteConfirmation = false },
+            title = {
+                Text("Delete this article?")
+            },
+            text = {
+                Text("This will remove it from the list.")
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showDeleteConfirmation = false
+                        onDelete()
+                    },
+                ) {
+                    Text(
+                        text = "Delete",
+                        color = MaterialTheme.colorScheme.error,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeleteConfirmation = false }) {
+                    Text("Cancel")
+                }
+            },
+        )
+    }
 
     SwipeToDismissBox(
         state = dismissState,
@@ -455,7 +723,11 @@ private fun NewsItemCard(
         Card(
             modifier = Modifier
                 .fillMaxWidth()
-                .clickable(onClick = onClick),
+                .clickable {
+                    if (dismissState.dismissDirection == SwipeToDismissBoxValue.Settled) {
+                        onClick()
+                    }
+                },
             shape = RoundedCornerShape(8.dp),
             colors = CardDefaults.cardColors(
                 containerColor = if (isRead) {
@@ -533,11 +805,13 @@ private fun NewsItemCard(
 private fun NewsSourceTag(source: NewsSource) {
     val containerColor = when (source) {
         NewsSource.CN_BETA -> MaterialTheme.colorScheme.primaryContainer
-        NewsSource.PCONLINE -> MaterialTheme.colorScheme.tertiaryContainer
+        NewsSource.PCONLINE_FLASH -> MaterialTheme.colorScheme.tertiaryContainer
+        NewsSource.PCONLINE_NEWS -> MaterialTheme.colorScheme.secondaryContainer
     }
     val contentColor = when (source) {
         NewsSource.CN_BETA -> MaterialTheme.colorScheme.onPrimaryContainer
-        NewsSource.PCONLINE -> MaterialTheme.colorScheme.onTertiaryContainer
+        NewsSource.PCONLINE_FLASH -> MaterialTheme.colorScheme.onTertiaryContainer
+        NewsSource.PCONLINE_NEWS -> MaterialTheme.colorScheme.onSecondaryContainer
     }
 
     Surface(
@@ -652,7 +926,7 @@ private fun ArticleScreen(
         }
 
         state.article != null -> ArticleContent(
-            article = state.article,
+            state = state,
             contentPadding = contentPadding,
         )
     }
@@ -660,9 +934,12 @@ private fun ArticleScreen(
 
 @Composable
 private fun ArticleContent(
-    article: NewsArticle,
+    state: ArticleUiState,
     contentPadding: PaddingValues,
 ) {
+    val article = state.article ?: return
+    val uriHandler = LocalUriHandler.current
+
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
@@ -682,12 +959,24 @@ private fun ArticleContent(
             val byline = listOf(article.source, article.publishedAt)
                 .filter { it.isNotBlank() }
                 .joinToString("  ")
-            if (byline.isNotBlank()) {
-                Text(
-                    text = byline,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                if (byline.isNotBlank()) {
+                    Text(
+                        text = byline,
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else {
+                    Spacer(modifier = Modifier.weight(1f))
+                }
+                TextButton(onClick = { uriHandler.openUri(state.item.url) }) {
+                    Text("Original")
+                }
             }
         }
 
@@ -719,8 +1008,121 @@ private fun ArticleContent(
             }
         }
 
+        if (state.commentsAvailable) {
+            item {
+                ArticleCommentsSection(
+                    comments = state.comments,
+                    isLoading = state.isLoadingComments,
+                    error = state.commentsError,
+                )
+            }
+        }
+
         item {
             Spacer(modifier = Modifier.height(20.dp))
+        }
+    }
+}
+
+@Composable
+private fun ArticleCommentsSection(
+    comments: List<ArticleComment>,
+    isLoading: Boolean,
+    error: String?,
+) {
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        HorizontalDivider()
+        Text(
+            text = "Comments",
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.SemiBold,
+        )
+
+        when {
+            isLoading -> Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                CircularProgressIndicator(modifier = Modifier.size(18.dp))
+                Text(
+                    text = "Loading comments...",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
+            error != null -> Text(
+                text = "Failed to load comments: $error",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.error,
+            )
+
+            comments.isEmpty() -> Text(
+                text = "No comments yet",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            else -> comments.forEach { comment ->
+                ArticleCommentCard(comment)
+            }
+        }
+    }
+}
+
+@Composable
+private fun ArticleCommentCard(comment: ArticleComment) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(8.dp),
+        color = MaterialTheme.colorScheme.surfaceContainerLow,
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = comment.author,
+                    modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (comment.publishedAt.isNotBlank()) {
+                    Text(
+                        text = comment.publishedAt,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            Text(
+                text = comment.content,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            if (comment.upVotes.isNotBlank() || comment.downVotes.isNotBlank()) {
+                Text(
+                    text = listOf(
+                        comment.upVotes.takeIf { it.isNotBlank() }?.let { "Up $it" },
+                        comment.downVotes.takeIf { it.isNotBlank() }?.let { "Down $it" },
+                    ).filterNotNull().joinToString("  "),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
     }
 }
@@ -829,7 +1231,7 @@ private fun NewsItemPreview() {
                 thumbnailUrl = "",
                 time = "20 min ago",
                 views = "17",
-                source = NewsSource.PCONLINE,
+                source = NewsSource.PCONLINE_NEWS,
             ),
             isRead = true,
             onClick = {},

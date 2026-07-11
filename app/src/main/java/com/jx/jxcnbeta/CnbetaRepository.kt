@@ -12,13 +12,15 @@ import org.jsoup.nodes.Element
 import java.io.IOException
 import java.net.CookieManager
 import java.net.CookiePolicy
+import java.nio.charset.Charset
 
 enum class NewsSource(
     val label: String,
     val shortLabel: String,
 ) {
     CN_BETA(label = "cnBeta", shortLabel = "CB"),
-    PCONLINE(label = "PConline", shortLabel = "PC"),
+    PCONLINE_FLASH(label = "PConline快报", shortLabel = "PC"),
+    PCONLINE_NEWS(label = "PConline资讯", shortLabel = "PC"),
 }
 
 data class NewsItem(
@@ -45,6 +47,14 @@ sealed interface ArticleBlock {
     data class Image(val url: String, val description: String) : ArticleBlock
 }
 
+data class ArticleComment(
+    val author: String,
+    val publishedAt: String,
+    val content: String,
+    val upVotes: String,
+    val downVotes: String,
+)
+
 class CnbetaRepository(
     context: Context,
 ) {
@@ -53,18 +63,21 @@ class CnbetaRepository(
     suspend fun fetchLatest(page: Int): List<NewsItem> = withContext(Dispatchers.IO) {
         val safePage = page.coerceAtLeast(1)
         val cnbetaResult = runCatching { fetchCnbetaLatest(safePage) }
-        val pconlineResult = runCatching { fetchPconlineLatest(safePage) }
+        val pconlineFlashResult = runCatching { fetchPconlineFlash(safePage) }
+        val pconlineNewsResult = runCatching { fetchPconlineNews(safePage) }
 
-        if (cnbetaResult.isFailure && pconlineResult.isFailure) {
+        if (cnbetaResult.isFailure && pconlineFlashResult.isFailure && pconlineNewsResult.isFailure) {
             throw IOException(
                 "cnBeta: ${cnbetaResult.exceptionOrNull()?.message}; " +
-                    "PConline: ${pconlineResult.exceptionOrNull()?.message}",
+                    "PConline快报: ${pconlineFlashResult.exceptionOrNull()?.message}; " +
+                    "PConline资讯: ${pconlineNewsResult.exceptionOrNull()?.message}",
             )
         }
 
         interleave(
             cnbetaItems = cnbetaResult.getOrDefault(emptyList()),
-            pconlineItems = pconlineResult.getOrDefault(emptyList()),
+            pconlineFlashItems = pconlineFlashResult.getOrDefault(emptyList()),
+            pconlineNewsItems = pconlineNewsResult.getOrDefault(emptyList()),
         )
     }
 
@@ -98,7 +111,7 @@ class CnbetaRepository(
         }
     }
 
-    private fun fetchPconlineLatest(page: Int): List<NewsItem> {
+    private fun fetchPconlineFlash(page: Int): List<NewsItem> {
         if (page == 1) {
             val doc = getDocument(
                 url = PCONLINE_MOBILE_LIST_URL,
@@ -122,7 +135,7 @@ class CnbetaRepository(
                     time = formatPconlineDate(timeElement?.attr("data-date").orEmpty())
                         .ifBlank { timeElement?.text().orEmpty() },
                     views = "",
-                    source = NewsSource.PCONLINE,
+                    source = NewsSource.PCONLINE_FLASH,
                 )
             }
         }
@@ -149,9 +162,53 @@ class CnbetaRepository(
                     .orEmpty(),
                 time = article.javascriptField("pc_pubDate"),
                 views = "",
-                source = NewsSource.PCONLINE,
+                source = NewsSource.PCONLINE_FLASH,
             )
         }.toList()
+    }
+
+    private fun fetchPconlineNews(page: Int): List<NewsItem> {
+        val url = if (page == 1) {
+            PCONLINE_NEWS_LIST_URL
+        } else {
+            "${PCONLINE_NEWS_LIST_URL}index_${page - 1}.html"
+        }
+        val doc = getDocument(
+            url = url,
+            referrer = PCONLINE_NEWS_LIST_URL,
+            charset = PCONLINE_DESKTOP_CHARSET,
+        )
+
+        return doc.select("div.list-wrap li").mapNotNull { item ->
+            val link = item.selectFirst("dl dt a[href]") ?: return@mapNotNull null
+            val href = link.attr("href")
+            val remoteId = pconlineIdRegex.find(href)?.groupValues?.get(1) ?: return@mapNotNull null
+            val title = link.text().trim()
+            if (title.isBlank()) return@mapNotNull null
+
+            val image = item.selectFirst("i.lpic img")
+            val thumbnailUrl = image?.attr("#src")
+                ?.takeIf { it.isNotBlank() }
+                ?.let(::absolutePconlineUrl)
+                ?: image?.absUrl("src")
+                    ?.takeUnless { it.contains("/blank.") }
+                    .orEmpty()
+            val time = item.selectFirst(".date")?.text()
+                ?.trim()
+                ?.trimStart('|')
+                ?.trim()
+                .orEmpty()
+
+            NewsItem(
+                id = pconlineItemId(remoteId),
+                title = title,
+                url = absolutePconlineUrl(href),
+                thumbnailUrl = thumbnailUrl,
+                time = time,
+                views = "",
+                source = NewsSource.PCONLINE_NEWS,
+            )
+        }.take(PCONLINE_NEWS_PAGE_SIZE)
     }
 
     suspend fun getCachedArticle(id: String): NewsArticle? = articleCache.read(id)
@@ -159,7 +216,18 @@ class CnbetaRepository(
     suspend fun refreshArticle(item: NewsItem): NewsArticle = withContext(Dispatchers.IO) {
         when (item.source) {
             NewsSource.CN_BETA -> refreshCnbetaArticle(item)
-            NewsSource.PCONLINE -> refreshPconlineArticle(item)
+            NewsSource.PCONLINE_FLASH,
+            NewsSource.PCONLINE_NEWS,
+            -> refreshPconlineArticle(item)
+        }
+    }
+
+    suspend fun fetchComments(item: NewsItem): List<ArticleComment> = withContext(Dispatchers.IO) {
+        when (item.source) {
+            NewsSource.CN_BETA -> fetchCnbetaComments(item.id)
+            NewsSource.PCONLINE_FLASH,
+            NewsSource.PCONLINE_NEWS,
+            -> emptyList()
         }
     }
 
@@ -226,14 +294,38 @@ class CnbetaRepository(
         return article
     }
 
+    private fun fetchCnbetaComments(remoteId: String): List<ArticleComment> {
+        val doc = getDocument(
+            url = "$CNBETA_BASE_URL/comment/$remoteId.htm",
+            referrer = "$CNBETA_BASE_URL/view/$remoteId.htm",
+        )
+
+        return doc.select("#J_commt_list > li").mapNotNull { item ->
+            val content = item.selectFirst(".con")?.text()?.trim().orEmpty()
+            if (content.isBlank()) return@mapNotNull null
+
+            val votes = item.select(".tools span")
+            ArticleComment(
+                author = item.selectFirst(".userName")?.text()?.trim().orEmpty()
+                    .ifBlank { "匿名人士" },
+                publishedAt = item.selectFirst(".title .time")?.text()?.trim().orEmpty(),
+                content = content,
+                upVotes = votes.getOrNull(0)?.text()?.trim().orEmpty(),
+                downVotes = votes.getOrNull(1)?.text()?.trim().orEmpty(),
+            )
+        }.take(CNBETA_COMMENT_LIMIT)
+    }
+
     private fun getDocument(
         url: String,
         referrer: String,
-    ): Document = Jsoup.parse(getText(url, referrer), url)
+        charset: Charset? = null,
+    ): Document = Jsoup.parse(getText(url, referrer, charset), url)
 
     private fun getText(
         url: String,
         referrer: String,
+        charset: Charset? = null,
     ): String {
         val request = Request.Builder()
             .url(url)
@@ -255,7 +347,12 @@ class CnbetaRepository(
                 throw IOException("HTTP ${response.code}")
             }
 
-            val html = response.body?.string().orEmpty()
+            val body = response.body ?: throw IOException("Empty response")
+            val html = if (charset == null) {
+                body.string()
+            } else {
+                body.bytes().toString(charset)
+            }
             if (html.isBlank()) {
                 throw IOException("Empty response")
             }
@@ -269,10 +366,10 @@ class CnbetaRepository(
         children().forEach { child ->
             when (child.tagName().lowercase()) {
                 "p" -> {
-                    val images = child.select("img[src]")
+                    val images = child.select("img")
                     if (images.isNotEmpty()) {
                         images.forEach { image ->
-                            val imageUrl = image.absUrl("src")
+                            val imageUrl = image.resolvedImageUrl()
                             if (imageUrl.isNotBlank()) {
                                 blocks += ArticleBlock.Image(
                                     url = imageUrl,
@@ -289,7 +386,7 @@ class CnbetaRepository(
                 }
 
                 "img" -> {
-                    val imageUrl = child.absUrl("src")
+                    val imageUrl = child.resolvedImageUrl()
                     if (imageUrl.isNotBlank()) {
                         blocks += ArticleBlock.Image(
                             url = imageUrl,
@@ -300,6 +397,19 @@ class CnbetaRepository(
             }
         }
         return blocks
+    }
+
+    private fun Element.resolvedImageUrl(): String {
+        val lazyUrl = attr("#src").ifBlank { attr("data-src") }
+        return if (lazyUrl.isNotBlank()) {
+            when {
+                lazyUrl.startsWith("//") -> "https:$lazyUrl"
+                lazyUrl.startsWith("http://") || lazyUrl.startsWith("https://") -> lazyUrl
+                else -> absUrl(if (hasAttr("#src")) "#src" else "data-src")
+            }
+        } else {
+            absUrl("src").takeUnless { it.contains("/blank.") }.orEmpty()
+        }
     }
 
     private fun absoluteCnbetaUrl(path: String): String = when {
@@ -318,12 +428,18 @@ class CnbetaRepository(
 
     private fun interleave(
         cnbetaItems: List<NewsItem>,
-        pconlineItems: List<NewsItem>,
-    ): List<NewsItem> = buildList(cnbetaItems.size + pconlineItems.size) {
-        val maxSize = maxOf(cnbetaItems.size, pconlineItems.size)
-        repeat(maxSize) { index ->
-            cnbetaItems.getOrNull(index)?.let(::add)
-            pconlineItems.getOrNull(index)?.let(::add)
+        pconlineFlashItems: List<NewsItem>,
+        pconlineNewsItems: List<NewsItem>,
+    ): List<NewsItem> {
+        val newsIds = pconlineNewsItems.mapTo(mutableSetOf()) { it.id }
+        val uniqueFlashItems = pconlineFlashItems.filterNot { it.id in newsIds }
+        return buildList(cnbetaItems.size + uniqueFlashItems.size + pconlineNewsItems.size) {
+            val maxSize = maxOf(cnbetaItems.size, uniqueFlashItems.size, pconlineNewsItems.size)
+            repeat(maxSize) { index ->
+                cnbetaItems.getOrNull(index)?.let(::add)
+                uniqueFlashItems.getOrNull(index)?.let(::add)
+                pconlineNewsItems.getOrNull(index)?.let(::add)
+            }
         }
     }
 
@@ -351,8 +467,11 @@ class CnbetaRepository(
         const val PCONLINE_BASE_URL = "https://www.pconline.com.cn"
         const val PCONLINE_MOBILE_LIST_URL = "https://g.pconline.com.cn/x/news/"
         const val PCONLINE_PAGE_URL_PREFIX = "$PCONLINE_BASE_URL/3g/2011/news/index_"
+        const val PCONLINE_NEWS_LIST_URL = "https://news.pconline.com.cn/it/"
         const val PCONLINE_MOBILE_ARTICLE_URL_PREFIX = "https://g.pconline.com.cn/x/"
         const val PCONLINE_ID_PREFIX = "pconline:"
+        const val PCONLINE_NEWS_PAGE_SIZE = 20
+        const val CNBETA_COMMENT_LIMIT = 20
         const val USER_AGENT =
             "Mozilla/5.0 (Linux; Android 15; Pixel 8) AppleWebKit/537.36 " +
                 "(KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36"
@@ -365,6 +484,7 @@ class CnbetaRepository(
             """\{\s*"channelName".*?\n\},?""",
             setOf(RegexOption.DOT_MATCHES_ALL),
         )
+        val PCONLINE_DESKTOP_CHARSET: Charset = Charset.forName("GB18030")
         val httpClient: OkHttpClient by lazy {
             val cookieManager = CookieManager().apply {
                 setCookiePolicy(CookiePolicy.ACCEPT_ALL)
